@@ -61,10 +61,12 @@ var (
 	rows           []*memoRow
 	listBox        *fyne.Container
 	setSelector    *widget.Select
+	topmostButton  *widget.Button
 	memoSets       []memoSet
 	activeSetName  string
 	windowHandle   atomic.Uintptr
 	hotkeyThreadID atomic.Uint32
+	alwaysOnTop    atomic.Bool
 	mainWindow     fyne.Window
 
 	loadingMemos          bool
@@ -92,6 +94,7 @@ func main() {
 	a := app.New()
 	w := a.NewWindow("TRPG Memo")
 	mainWindow = w
+	alwaysOnTop.Store(true)
 	loadedSets, selectedSet, err := loadMemoSets()
 	if err != nil {
 		persistenceDisabled = true
@@ -141,9 +144,15 @@ func buildUI(w fyne.Window) fyne.CanvasObject {
 		dialog.ShowInformation("簡易ヘルプ", "Alt+Z: 選択中の文字列をコピーして単語に追加\n「+」: 空欄を追加", w)
 	})
 	helpButton.Importance = widget.LowImportance
+	topmostButton = widget.NewButton(topmostButtonText(), func() {
+		if err := toggleAlwaysOnTop(); err != nil {
+			dialog.ShowError(err, w)
+		}
+	})
+	topmostButton.Importance = widget.LowImportance
 	closeButton := widget.NewButton("×", w.Close)
 	closeButton.Importance = widget.LowImportance
-	headerActions := container.NewHBox(helpButton, closeButton)
+	headerActions := container.NewHBox(helpButton, topmostButton, closeButton)
 	headerContent := container.NewBorder(nil, nil, nil, headerActions, container.NewStack(title, newDragHandle()))
 	header := container.NewStack(headerBg, headerContent)
 
@@ -392,6 +401,27 @@ func renameMemoSet(name string) error {
 		return err
 	}
 	refreshSetSelector()
+	return nil
+}
+
+func topmostButtonText() string {
+	if alwaysOnTop.Load() {
+		return "最前面 ON"
+	}
+	return "最前面 OFF"
+}
+
+func toggleAlwaysOnTop() error {
+	enabled := !alwaysOnTop.Load()
+	if hwnd := windowHandle.Load(); hwnd != 0 {
+		if err := setWindowAlwaysOnTop(hwnd, enabled); err != nil {
+			return err
+		}
+	}
+	alwaysOnTop.Store(enabled)
+	if topmostButton != nil {
+		topmostButton.SetText(topmostButtonText())
+	}
 	return nil
 }
 
@@ -990,6 +1020,7 @@ const (
 	WS_SYSMENU       = 0x00080000
 	GWL_STYLE        = ^uintptr(15)
 	HWND_TOPMOST     = ^uintptr(0)
+	HWND_NOTOPMOST   = ^uintptr(1)
 	SWP_NOMOVE       = 0x0002
 	SWP_NOSIZE       = 0x0001
 	SWP_NOACTIVATE   = 0x0010
@@ -1010,15 +1041,31 @@ func applyWindowsStyle(w fyne.Window) {
 	newStyle := style &^ uintptr(WS_CAPTION|WS_MINIMIZEBOX|WS_MAXIMIZEBOX|WS_SYSMENU)
 	setWindowLongW.Call(uintptr(hwnd), uintptr(GWL_STYLE), newStyle)
 
-	setWindowPos.Call(
-		uintptr(hwnd),
-		uintptr(HWND_TOPMOST),
+	if err := setWindowAlwaysOnTop(uintptr(hwnd), alwaysOnTop.Load()); err != nil {
+		log.Printf("Window topmost style error: %v", err)
+		fyne.Do(func() {
+			dialog.ShowError(err, w)
+		})
+	}
+}
+
+func setWindowAlwaysOnTop(hwnd uintptr, enabled bool) error {
+	insertAfter := uintptr(HWND_NOTOPMOST)
+	if enabled {
+		insertAfter = uintptr(HWND_TOPMOST)
+	}
+	if result, _, err := setWindowPos.Call(
+		hwnd,
+		insertAfter,
 		0,
 		0,
 		0,
 		0,
-		uintptr(SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW|SWP_FRAMECHANGED),
-	)
+		uintptr(SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW),
+	); result == 0 {
+		return fmt.Errorf("前面固定状態を変更できませんでした: %v", err)
+	}
+	return nil
 }
 
 func findWindowByTitle(title string) uintptr {

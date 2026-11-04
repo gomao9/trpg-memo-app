@@ -62,6 +62,39 @@ func TestMemoEntryAllowsTyping(t *testing.T) {
 	}
 }
 
+func TestToggleAlwaysOnTopUpdatesButton(t *testing.T) {
+	testApp := fynetesting.NewApp()
+	defer testApp.Quit()
+	defer func() {
+		topmostButton = nil
+		windowHandle.Store(0)
+		alwaysOnTop.Store(true)
+	}()
+
+	windowHandle.Store(0)
+	alwaysOnTop.Store(true)
+	topmostButton = widget.NewButton(topmostButtonText(), nil)
+	if err := toggleAlwaysOnTop(); err != nil {
+		t.Fatalf("toggleAlwaysOnTop() disabling error = %v", err)
+	}
+	if alwaysOnTop.Load() {
+		t.Fatal("alwaysOnTop remains enabled after disabling")
+	}
+	if got, want := topmostButton.Text, "最前面 OFF"; got != want {
+		t.Fatalf("button text = %q, want %q", got, want)
+	}
+
+	if err := toggleAlwaysOnTop(); err != nil {
+		t.Fatalf("toggleAlwaysOnTop() enabling error = %v", err)
+	}
+	if !alwaysOnTop.Load() {
+		t.Fatal("alwaysOnTop remains disabled after enabling")
+	}
+	if got, want := topmostButton.Text, "最前面 ON"; got != want {
+		t.Fatalf("button text = %q, want %q", got, want)
+	}
+}
+
 func TestMemoSetPersistenceRoundTripAndReplace(t *testing.T) {
 	t.Setenv("APPDATA", t.TempDir())
 
