@@ -23,29 +23,57 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"golang.org/x/sys/windows"
 )
 
 type memoRow struct {
-	entry       *widget.Entry
-	del         *widget.Button
-	view        fyne.CanvasObject
-	dragOverlay *canvas.Rectangle
-	dragging    bool
+	entry        *widget.Entry
+	del          *widget.Button
+	view         fyne.CanvasObject
+	handle       *reorderHandle
+	dragOverlay  *canvas.Rectangle
+	detail       string
+	detailPopup  *widget.PopUp
+	detailEditor fyne.Window
+	dragging     bool
+}
+
+type memoData struct {
+	Text   string `json:"text"`
+	Detail string `json:"detail,omitempty"`
+}
+
+type memoSet struct {
+	Name  string     `json:"name"`
+	Memos []memoData `json:"memos"`
+}
+
+type storedMemoFile struct {
+	Version   int       `json:"version"`
+	ActiveSet string    `json:"activeSet"`
+	Sets      []memoSet `json:"sets"`
 }
 
 var (
 	rows           []*memoRow
 	listBox        *fyne.Container
+	setSelector    *widget.Select
+	memoSets       []memoSet
+	activeSetName  string
 	windowHandle   atomic.Uintptr
 	hotkeyThreadID atomic.Uint32
 	mainWindow     fyne.Window
 
 	loadingMemos          bool
+	updatingSetSelector   bool
 	persistenceDisabled   bool
 	persistenceErrorShown bool
 )
+
+const defaultMemoSetName = "単語セット 1"
 
 const (
 	MOD_ALT         = 0x0001
@@ -64,10 +92,18 @@ func main() {
 	a := app.New()
 	w := a.NewWindow("TRPG Memo")
 	mainWindow = w
-	memos, err := loadMemos()
+	loadedSets, selectedSet, err := loadMemoSets()
 	if err != nil {
 		persistenceDisabled = true
+		loadedSets = []memoSet{{Name: defaultMemoSetName, Memos: []memoData{}}}
+		selectedSet = defaultMemoSetName
 	}
+	if len(loadedSets) == 0 {
+		loadedSets = []memoSet{{Name: defaultMemoSetName, Memos: []memoData{}}}
+		selectedSet = defaultMemoSetName
+	}
+	memoSets = loadedSets
+	activeSetName = selectedSet
 	w.Resize(fyne.NewSize(300, 420))
 	w.SetPadded(false)
 	w.SetContent(buildUI(w))
@@ -83,16 +119,9 @@ func main() {
 		applyWindowsStyle(w)
 	}()
 
-	loadingMemos = true
-	for _, memo := range memos {
-		appendRow(memo)
-	}
-	loadingMemos = false
+	displayMemoSet(selectedSetMemos())
 	if err != nil {
 		reportPersistenceError(fmt.Errorf("保存済みメモを読み込めませんでした: %w", err))
-	}
-	if len(memos) == 0 {
-		appendRow("")
 	}
 	a.Run()
 }
@@ -108,9 +137,14 @@ func buildUI(w fyne.Window) fyne.CanvasObject {
 	title.TextStyle = fyne.TextStyle{Bold: true}
 	title.Alignment = fyne.TextAlignCenter
 	title.TextSize = 14
+	helpButton := widget.NewButton("?", func() {
+		dialog.ShowInformation("簡易ヘルプ", "Alt+Z: 選択中の文字列をコピーして単語に追加\n「+」: 空欄を追加", w)
+	})
+	helpButton.Importance = widget.LowImportance
 	closeButton := widget.NewButton("×", w.Close)
 	closeButton.Importance = widget.LowImportance
-	headerContent := container.NewBorder(nil, nil, nil, closeButton, container.NewStack(title, newDragHandle()))
+	headerActions := container.NewHBox(helpButton, closeButton)
+	headerContent := container.NewBorder(nil, nil, nil, headerActions, container.NewStack(title, newDragHandle()))
 	header := container.NewStack(headerBg, headerContent)
 
 	listBox = container.NewVBox()
@@ -122,7 +156,41 @@ func buildUI(w fyne.Window) fyne.CanvasObject {
 	})
 	addBtn.Importance = widget.MediumImportance
 
-	content := container.NewBorder(header, addBtn, nil, nil, scroll)
+	setSelector = widget.NewSelect(memoSetNames(), func(name string) {
+		if updatingSetSelector {
+			return
+		}
+		if err := switchMemoSet(name); err != nil {
+			reportPersistenceError(err)
+			refreshSetSelector()
+		}
+	})
+	updatingSetSelector = true
+	setSelector.SetSelected(activeSetName)
+	updatingSetSelector = false
+	addSetBtn := widget.NewButton("+セット", func() {
+		nameDialog := dialog.NewEntryDialog("単語セットを追加", "セット名を入力してください", func(name string) {
+			if err := createMemoSet(name); err != nil {
+				dialog.ShowError(err, w)
+			}
+		}, w)
+		nameDialog.Resize(fyne.NewSize(440, 160))
+		nameDialog.Show()
+	})
+	renameSetBtn := widget.NewButton("名前変更", func() {
+		nameDialog := dialog.NewEntryDialog("単語セット名を変更", "新しいセット名を入力してください", func(name string) {
+			if err := renameMemoSet(name); err != nil {
+				dialog.ShowError(err, w)
+			}
+		}, w)
+		nameDialog.SetText(activeSetName)
+		nameDialog.Resize(fyne.NewSize(440, 160))
+		nameDialog.Show()
+	})
+	setActions := container.NewHBox(renameSetBtn, addSetBtn)
+	setBar := container.NewBorder(nil, nil, nil, setActions, setSelector)
+	body := container.NewBorder(setBar, nil, nil, nil, scroll)
+	content := container.NewBorder(header, addBtn, nil, nil, body)
 	return container.NewStack(bg, content)
 }
 
@@ -160,13 +228,14 @@ func (h *dragHandle) MouseUp(*desktop.MouseEvent) {
 }
 
 func appendRow(raw string) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		trimmed = ""
-	}
+	appendMemo(memoData{Text: raw})
+}
 
+func appendMemo(memo memoData) {
+	memo.Text = strings.TrimSpace(memo.Text)
 	entry := widget.NewEntry()
-	entry.SetText(trimmed)
+	entry.Enable()
+	entry.SetText(memo.Text)
 	entry.SetPlaceHolder("固有名詞")
 	entry.OnChanged = func(string) {
 		saveMemos()
@@ -177,18 +246,162 @@ func appendRow(raw string) {
 	})
 	del.Importance = widget.DangerImportance
 
-	row := &memoRow{entry: entry, del: del}
+	row := &memoRow{entry: entry, del: del, detail: memo.Detail}
 	row.dragOverlay = canvas.NewRectangle(color.NRGBA{R: 255, G: 216, B: 112, A: 105})
 	row.dragOverlay.StrokeColor = color.NRGBA{R: 174, G: 111, B: 27, A: 235}
 	row.dragOverlay.StrokeWidth = 2
 	row.dragOverlay.CornerRadius = 4
 	row.dragOverlay.Hide()
-	rowContent := container.NewBorder(nil, nil, newReorderHandle(row), row.del, row.entry)
+	row.handle = newReorderHandle(row)
+	rowContent := container.NewBorder(nil, nil, row.handle, row.del, &memoEntry{Entry: entry, row: row})
 	row.view = container.NewStack(rowContent, row.dragOverlay)
 	rows = append(rows, row)
 	listBox.Add(row.view)
 	listBox.Refresh()
 	saveMemos()
+}
+
+func memoSetNames() []string {
+	names := make([]string, 0, len(memoSets))
+	for _, set := range memoSets {
+		names = append(names, set.Name)
+	}
+	return names
+}
+
+func refreshSetSelector() {
+	if setSelector == nil {
+		return
+	}
+	updatingSetSelector = true
+	setSelector.Options = memoSetNames()
+	setSelector.SetSelected(activeSetName)
+	setSelector.Refresh()
+	updatingSetSelector = false
+}
+
+func selectedSetMemos() []memoData {
+	for _, set := range memoSets {
+		if set.Name == activeSetName {
+			return set.Memos
+		}
+	}
+	return nil
+}
+
+func displayMemoSet(memos []memoData) {
+	loadingMemos = true
+	rows = nil
+	listBox.RemoveAll()
+	for _, memo := range memos {
+		appendMemo(memo)
+	}
+	if len(memos) == 0 {
+		appendMemo(memoData{})
+	}
+	loadingMemos = false
+	listBox.Refresh()
+	saveMemos()
+}
+
+func switchMemoSet(name string) error {
+	if name == activeSetName {
+		return nil
+	}
+	found := false
+	for _, set := range memoSets {
+		if set.Name == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("単語セット %q が見つかりません", name)
+	}
+	if err := persistMemos(); err != nil {
+		disablePersistence(err)
+		return err
+	}
+	activeSetName = name
+	refreshSetSelector()
+	displayMemoSet(selectedSetMemos())
+	return nil
+}
+
+func createMemoSet(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("セット名を入力してください")
+	}
+	for _, set := range memoSets {
+		if strings.EqualFold(set.Name, name) {
+			return fmt.Errorf("単語セット %q はすでに存在します", name)
+		}
+	}
+	if err := persistMemos(); err != nil {
+		disablePersistence(err)
+		return err
+	}
+	memoSets = append(memoSets, memoSet{Name: name, Memos: []memoData{}})
+	activeSetName = name
+	refreshSetSelector()
+	displayMemoSet(nil)
+	return nil
+}
+
+func renameMemoSet(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("セット名を入力してください")
+	}
+	if name == activeSetName {
+		return nil
+	}
+	for _, set := range memoSets {
+		if strings.EqualFold(set.Name, name) {
+			return fmt.Errorf("単語セット %q はすでに存在します", name)
+		}
+	}
+	if err := persistMemos(); err != nil {
+		disablePersistence(err)
+		return err
+	}
+
+	oldName := activeSetName
+	found := false
+	for i := range memoSets {
+		if memoSets[i].Name == oldName {
+			memoSets[i].Name = name
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("単語セット %q が見つかりません", oldName)
+	}
+	activeSetName = name
+	if err := writeMemoSets(memoSets, activeSetName); err != nil {
+		activeSetName = oldName
+		for i := range memoSets {
+			if memoSets[i].Name == name {
+				memoSets[i].Name = oldName
+				break
+			}
+		}
+		disablePersistence(err)
+		return err
+	}
+	refreshSetSelector()
+	return nil
+}
+
+type memoEntry struct {
+	*widget.Entry
+	row *memoRow
+}
+
+func (e *memoEntry) TappedSecondary(event *fyne.PointEvent) {
+	e.row.showDetail(event.AbsolutePosition)
 }
 
 type reorderHandle struct {
@@ -211,6 +424,110 @@ func (h *reorderHandle) CreateRenderer() fyne.WidgetRenderer {
 	h.grip.Alignment = fyne.TextAlignCenter
 	h.grip.TextSize = 18
 	return widget.NewSimpleRenderer(container.NewStack(h.background, h.grip))
+}
+
+func (h *reorderHandle) TappedSecondary(event *fyne.PointEvent) {
+	h.row.showDetail(event.AbsolutePosition)
+}
+
+func (r *memoRow) showDetail(position fyne.Position) {
+	text := strings.TrimSpace(r.detail)
+	if text == "" {
+		text = "詳細は未登録です"
+	}
+	if r.detailPopup != nil {
+		r.detailPopup.Hide()
+	}
+	r.detailPopup = widget.NewPopUp(newDetailPopupContent(text, mainWindow.Canvas().Size(), func() {
+		r.detailPopup.Hide()
+		editMemoDetail(r)
+	}), mainWindow.Canvas())
+	popupSize := r.detailPopup.MinSize()
+	canvasSize := mainWindow.Canvas().Size()
+	x := position.X
+	y := position.Y
+	if x+popupSize.Width > canvasSize.Width {
+		x = canvasSize.Width - popupSize.Width
+	}
+	if x < 0 {
+		x = 0
+	}
+	if y+popupSize.Height > canvasSize.Height {
+		y = canvasSize.Height - popupSize.Height
+	}
+	if y < 0 {
+		y = 0
+	}
+	r.detailPopup.ShowAtPosition(fyne.NewPos(x, y))
+}
+
+type detailPopupLayout struct {
+	size         fyne.Size
+	padding      float32
+	buttonHeight float32
+}
+
+func (l detailPopupLayout) MinSize([]fyne.CanvasObject) fyne.Size {
+	return l.size
+}
+
+func (l detailPopupLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	if len(objects) < 2 {
+		return
+	}
+	objects[0].Move(fyne.NewPos(l.padding, l.padding))
+	objects[0].Resize(fyne.NewSize(size.Width-2*l.padding, size.Height-3*l.padding-l.buttonHeight))
+	objects[1].Move(fyne.NewPos(size.Width-l.padding-objects[1].MinSize().Width, size.Height-l.padding-l.buttonHeight))
+	objects[1].Resize(fyne.NewSize(objects[1].MinSize().Width, l.buttonHeight))
+}
+
+func newDetailPopupContent(text string, canvasSize fyne.Size, onEdit func()) fyne.CanvasObject {
+	width := float32(360)
+	if canvasSize.Width > 0 && width > canvasSize.Width-24 {
+		width = canvasSize.Width - 24
+	}
+	if width < 180 {
+		width = 180
+	}
+	padding := theme.Padding()
+	label := widget.NewRichTextWithText(text)
+	label.Wrapping = fyne.TextWrapWord
+	label.Resize(fyne.NewSize(width-2*padding, 10000))
+	editButton := widget.NewButton("編集", onEdit)
+	buttonHeight := editButton.MinSize().Height
+	height := label.MinSize().Height + 3*padding + buttonHeight
+	if height < 2*padding+theme.TextSize() {
+		height = 2*padding + theme.TextSize()
+	}
+	size := fyne.NewSize(width, height)
+	return container.New(detailPopupLayout{size: size, padding: padding, buttonHeight: buttonHeight}, label, editButton)
+}
+
+func editMemoDetail(row *memoRow) {
+	if row.detailEditor != nil {
+		row.detailEditor.Show()
+		return
+	}
+
+	editor := widget.NewMultiLineEntry()
+	editor.SetText(row.detail)
+	editor.SetPlaceHolder("このメモの詳細")
+	editor.SetMinRowsVisible(5)
+	editorWindow := fyne.CurrentApp().NewWindow("詳細を編集")
+	row.detailEditor = editorWindow
+	editorWindow.SetOnClosed(func() {
+		row.detailEditor = nil
+	})
+	cancelButton := widget.NewButton("キャンセル", editorWindow.Close)
+	saveButton := widget.NewButton("保存", func() {
+		row.detail = strings.TrimSpace(editor.Text)
+		saveMemos()
+		editorWindow.Close()
+	})
+	buttons := container.NewHBox(layout.NewSpacer(), cancelButton, saveButton)
+	editorWindow.SetContent(container.NewBorder(nil, buttons, nil, nil, editor))
+	editorWindow.Resize(fyne.NewSize(460, 320))
+	editorWindow.Show()
 }
 
 func (h *reorderHandle) Dragged(event *fyne.DragEvent) {
@@ -326,27 +643,61 @@ func memoFilePath() (string, error) {
 	return filepath.Join(configDir, "trpg-memo-app", "memos.json"), nil
 }
 
-func loadMemos() ([]string, error) {
+func loadMemoSets() ([]memoSet, string, error) {
 	path, err := memoFilePath()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return []memoSet{{Name: defaultMemoSetName, Memos: []memoData{}}}, defaultMemoSetName, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%s を読み込めません: %w", path, err)
+		return nil, "", fmt.Errorf("%s を読み込めません: %w", path, err)
 	}
 
-	var memos []string
-	if err := json.Unmarshal(data, &memos); err != nil {
-		return nil, fmt.Errorf("%s の形式が不正です: %w", path, err)
+	var legacyMemos []string
+	if err := json.Unmarshal(data, &legacyMemos); err == nil && legacyMemos != nil {
+		memos := make([]memoData, 0, len(legacyMemos))
+		for _, text := range legacyMemos {
+			memos = append(memos, memoData{Text: text})
+		}
+		return []memoSet{{Name: defaultMemoSetName, Memos: memos}}, defaultMemoSetName, nil
 	}
-	if memos == nil {
-		return nil, fmt.Errorf("%s の形式が不正です: メモ一覧は JSON 配列である必要があります", path)
+
+	var header struct {
+		Version int `json:"version"`
 	}
-	return memos, nil
+	if err := json.Unmarshal(data, &header); err != nil {
+		return nil, "", fmt.Errorf("%s の形式が不正です: %w", path, err)
+	}
+	if header.Version == 2 {
+		var legacy struct {
+			Version int        `json:"version"`
+			Memos   []memoData `json:"memos"`
+		}
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return nil, "", fmt.Errorf("%s の形式が不正です: %w", path, err)
+		}
+		if legacy.Memos == nil {
+			return nil, "", fmt.Errorf("%s の形式が不正です: メモ一覧がありません", path)
+		}
+		return []memoSet{{Name: defaultMemoSetName, Memos: legacy.Memos}}, defaultMemoSetName, nil
+	}
+	if header.Version != 3 {
+		return nil, "", fmt.Errorf("%s の形式が不正です: 未対応のデータバージョン %d", path, header.Version)
+	}
+	var stored storedMemoFile
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return nil, "", fmt.Errorf("%s の形式が不正です: %w", path, err)
+	}
+	if stored.Sets == nil {
+		return nil, "", fmt.Errorf("%s の形式が不正です: 単語セット一覧がありません", path)
+	}
+	if err := validateMemoSets(stored.Sets, stored.ActiveSet); err != nil {
+		return nil, "", fmt.Errorf("%s の形式が不正です: %w", path, err)
+	}
+	return stored.Sets, stored.ActiveSet, nil
 }
 
 func saveMemos() {
@@ -354,16 +705,58 @@ func saveMemos() {
 		return
 	}
 
-	memos := make([]string, 0, len(rows))
-	for _, row := range rows {
-		memos = append(memos, row.entry.Text)
-	}
-	if err := writeMemos(memos); err != nil {
+	if err := persistMemos(); err != nil {
 		disablePersistence(err)
 	}
 }
 
-func writeMemos(memos []string) error {
+func persistMemos() error {
+	memos := make([]memoData, 0, len(rows))
+	for _, row := range rows {
+		memos = append(memos, memoData{Text: row.entry.Text, Detail: row.detail})
+	}
+	for i := range memoSets {
+		if memoSets[i].Name == activeSetName {
+			memoSets[i].Memos = memos
+			return writeMemoSets(memoSets, activeSetName)
+		}
+	}
+	return fmt.Errorf("選択中の単語セット %q が見つかりません", activeSetName)
+}
+
+func validateMemoSets(sets []memoSet, activeSet string) error {
+	if len(sets) == 0 {
+		return errors.New("単語セットがありません")
+	}
+	foundActiveSet := false
+	names := make(map[string]struct{}, len(sets))
+	for i := range sets {
+		name := strings.TrimSpace(sets[i].Name)
+		if name == "" {
+			return fmt.Errorf("%d 番目の単語セット名が空です", i+1)
+		}
+		key := strings.ToLower(name)
+		if _, exists := names[key]; exists {
+			return fmt.Errorf("単語セット名 %q が重複しています", name)
+		}
+		names[key] = struct{}{}
+		if sets[i].Memos == nil {
+			return fmt.Errorf("単語セット %q のメモ一覧がありません", name)
+		}
+		if name == activeSet {
+			foundActiveSet = true
+		}
+	}
+	if !foundActiveSet {
+		return fmt.Errorf("選択中の単語セット %q がありません", activeSet)
+	}
+	return nil
+}
+
+func writeMemoSets(sets []memoSet, activeSet string) error {
+	if err := validateMemoSets(sets, activeSet); err != nil {
+		return err
+	}
 	path, err := memoFilePath()
 	if err != nil {
 		return err
@@ -371,9 +764,9 @@ func writeMemos(memos []string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fmt.Errorf("%s を作成できません: %w", filepath.Dir(path), err)
 	}
-	data, err := json.MarshalIndent(memos, "", "  ")
+	data, err := json.MarshalIndent(storedMemoFile{Version: 3, ActiveSet: activeSet, Sets: sets}, "", "  ")
 	if err != nil {
-		return fmt.Errorf("メモを JSON に変換できません: %w", err)
+		return fmt.Errorf("単語セットを JSON に変換できません: %w", err)
 	}
 
 	tempFile, err := os.CreateTemp(filepath.Dir(path), ".memos-*.tmp")
